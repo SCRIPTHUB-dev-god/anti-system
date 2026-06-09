@@ -1,0 +1,162 @@
+local Players = game:GetService("Players")
+local TeleportService = game:GetService("TeleportService")
+local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Notif loader
+local notif = loadstring(game:HttpGet("https://raw.githubusercontent.com/SCRIPTHUB-dev-god/gamehub/refs/heads/main/notification.lua"))()
+
+-- Config
+local TP_DISTANCE_THRESHOLD = 150 -- studs per frame dianggap teleport
+local SPEED_THRESHOLD = 120 -- studs/s
+local FLY_TIME_THRESHOLD = 5 -- detik di udara tanpa jatuh
+local SPAM_COUNT = 5 -- jumlah pelanggaran dalam window
+local SPAM_WINDOW = 3 -- detik
+local CHECK_INTERVAL = 0.2
+
+local STAFF_GROUP_ID = 0
+local STAFF_MIN_RANK = 250
+local STAFF_USERNAMES = {}
+
+local violations = {}
+local lastNotify = 0
+local flyStart = nil
+
+local function sendDanger(reason)
+    if tick() - lastNotify < 8 then return end
+    lastNotify = tick()
+    pcall(function()
+        notif.send("danger!", reason or "pls reduce script", 5)
+    end)
+end
+
+local function addViolation(type)
+    local now = tick()
+    table.insert(violations, {t = now, type = type})
+    -- bersihkan yang lama
+    for i = #violations, 1, -1 do
+        if now - violations[i].t > SPAM_WINDOW then
+            table.remove(violations, i)
+        end
+    end
+    if #violations >= SPAM_COUNT then
+        sendDanger("excessive "..type.." detected")
+        violations = {}
+    end
+end
+
+local function isStaff(player)
+    if table.find(STAFF_USERNAMES, player.Name) then return true end
+    if STAFF_GROUP_ID ~= 0 then
+        local s, rank = pcall(function() return player:GetRankInGroup(STAFF_GROUP_ID) end)
+        if s and rank >= STAFF_MIN_RANK then return true end
+    end
+    local lower = player.DisplayName:lower()
+    if lower:find("mod") or lower:find("admin") or lower:find("dev") or lower:find("staff") then
+        return true
+    end
+    return false
+end
+
+local function serverHop()
+    pcall(function() notif.send("staff detected!", "hopping server...", 5) end)
+    task.wait(1)
+    local placeId = game.PlaceId
+    local servers = {}
+    local s, result = pcall(function()
+        return HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/"..placeId.."/servers/Public?sortOrder=Asc&limit=100"))
+    end)
+    if s and result and result.data then
+        for _, server in ipairs(result.data) do
+            if server.playing < server.maxPlayers and server.id ~= game.JobId then
+                table.insert(servers, server.id)
+            end
+        end
+    end
+    if #servers > 0 then
+        TeleportService:TeleportToPlaceInstance(placeId, servers[math.random(1,#servers)], LocalPlayer)
+    else
+        TeleportService:Teleport(placeId, LocalPlayer)
+    end
+end
+
+-- Staff monitor
+Players.PlayerAdded:Connect(function(plr)
+    if isStaff(plr) then serverHop() end
+end)
+for _, plr in ipairs(Players:GetPlayers()) do
+    if plr ~= LocalPlayer and isStaff(plr) then serverHop() break end
+end
+
+-- Excessive script monitor
+local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local HRP = Character:WaitForChild("HumanoidRootPart")
+local Humanoid = Character:WaitForChild("Humanoid")
+
+LocalPlayer.CharacterAdded:Connect(function(char)
+    Character = char
+    HRP = char:WaitForChild("HumanoidRootPart")
+    Humanoid = char:WaitForChild("Humanoid")
+end)
+
+local lastPos = HRP.Position
+RunService.Heartbeat:Connect(function(dt)
+    if not HRP or not Humanoid then return end
+    local pos = HRP.Position
+    local dist = (pos - lastPos).Magnitude
+    local speed = dist / dt
+
+    -- Teleport spam
+    if dist > TP_DISTANCE_THRESHOLD then
+        addViolation("teleport")
+    end
+
+    -- Speed hack
+    if speed > SPEED_THRESHOLD and Humanoid.MoveDirection.Magnitude > 0 then
+        addViolation("speed")
+    end
+
+    -- Fly detection
+    if Humanoid.FloorMaterial == Enum.Material.Air then
+        if not flyStart then flyStart = tick() end
+        if tick() - flyStart > FLY_TIME_THRESHOLD and speed > 50 then
+            addViolation("fly")
+            flyStart = tick()
+        end
+    else
+        flyStart = nil
+    end
+
+    lastPos = pos
+end)
+
+-- Deteksi spam tool / remote
+local remoteSpam = {}
+local function hookRemote(remote)
+    local old
+    old = hookfunction(remote.FireServer, function(self,...)
+        local now = tick()
+        remoteSpam[self] = remoteSpam[self] or {}
+        table.insert(remoteSpam[self], now)
+        -- bersihkan
+        for i = #remoteSpam[self], 1, -1 do
+            if now - remoteSpam[self][i] > 1 then
+                table.remove(remoteSpam[self], i)
+            end
+        end
+        if #remoteSpam[self] > 20 then
+            addViolation("remote spam")
+            remoteSpam[self] = {}
+        end
+        return old(self,...)
+    end)
+end
+
+for _, v in ipairs(game:GetDescendants()) do
+    if v:IsA("RemoteEvent") then
+        pcall(function() hookRemote(v) end)
+    end
+end
