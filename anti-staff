@@ -1,162 +1,423 @@
-local Players = game:GetService("Players")
+-- v1.0.0 | Anti-Staff ServerHop + Anti-Troll Violation Engine + Anti-Kick __namecall Chain Hook
+-- Added: StaffDetect(User/Group/Keyword), TeleSpam/SpeedHack/Fly/RemoteSpam Scan, KickBlock+CoreGuiWatch, CharAutoRebind | Fixed: -
+
+-- ════════════════════════════════════════════════════════════════
+-- CONFIGURATION
+-- ════════════════════════════════════════════════════════════════
+local CONFIG = {
+    Staff = {
+        Usernames = {
+            "Roblox",
+            "Builderman",
+        },
+        GroupID  = 0,
+        MinRank  = 100,
+        Keywords = {
+            "mod", "admin", "dev", "staff", "moderator",
+            "administrator", "owner", "helper", "support",
+            "officer", "manager", "supervisor",
+        },
+    },
+    Troll = {
+        TeleThreshold   = 150,
+        SpeedThreshold  = 120,
+        FlyTimeLimit    = 5,
+        FlySpeedMin     = 50,
+        RemoteSpamLimit = 20,
+        ViolationLimit  = 5,
+        ViolationWindow = 3,
+        NotifCooldown   = 60,
+    },
+    Hop = {
+        CandidatePool = 10,
+        FetchPages    = 2,
+        RetryDelay    = 8,
+    },
+}
+
+-- ════════════════════════════════════════════════════════════════
+-- SERVICES
+-- ════════════════════════════════════════════════════════════════
+local Players         = game:GetService("Players")
+local RunService      = game:GetService("RunService")
 local TeleportService = game:GetService("TeleportService")
-local HttpService = game:GetService("HttpService")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
+local HttpService     = game:GetService("HttpService")
+local CoreGui         = game:GetService("CoreGui")
 
-local LocalPlayer = Players.LocalPlayer
+local LP    = Players.LocalPlayer
+local Place = game.PlaceId
 
--- Notif loader
-local notif = loadstring(game:HttpGet("https://raw.githubusercontent.com/SCRIPTHUB-dev-god/gamehub/refs/heads/main/notification.lua"))()
+-- ════════════════════════════════════════════════════════════════
+-- NOTIFICATION MODULE
+-- ════════════════════════════════════════════════════════════════
+local notif = loadstring(game:HttpGet(
+    "https://raw.githubusercontent.com/SCRIPTHUB-dev-god/gamehub/refs/heads/main/notification.lua"
+))()
 
--- Config
-local TP_DISTANCE_THRESHOLD = 150 -- studs per frame dianggap teleport
-local SPEED_THRESHOLD = 120 -- studs/s
-local FLY_TIME_THRESHOLD = 5 -- detik di udara tanpa jatuh
-local SPAM_COUNT = 5 -- jumlah pelanggaran dalam window
-local SPAM_WINDOW = 3 -- detik
-local CHECK_INTERVAL = 0.2
+local function Notify(title, body, dur)
+    pcall(notif.send, title, body, dur or 5)
+end
 
-local STAFF_GROUP_ID = 0
-local STAFF_MIN_RANK = 250
-local STAFF_USERNAMES = {}
+-- ════════════════════════════════════════════════════════════════
+-- STATE
+-- ════════════════════════════════════════════════════════════════
+local State = {
+    Hopping       = false,
+    StaffLocked   = false,
+    Char          = nil,
+    Root          = nil,
+    Hum           = nil,
+    LastPos       = nil,
+    AirTimer      = 0,
+    LastNotifAt   = -math.huge,
+    Violations    = {},
+    RemoteCache   = setmetatable({}, { __mode = "k" }),
+    Connections   = {},
+    NamecallChain = nil,
+}
 
-local violations = {}
-local lastNotify = 0
-local flyStart = nil
+-- ════════════════════════════════════════════════════════════════
+-- SERVER HOP ENGINE
+-- ════════════════════════════════════════════════════════════════
+local function FetchPage(cursor)
+    local suffix = cursor and ("&cursor=" .. tostring(cursor)) or ""
+    local url    = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100%s"):format(Place, suffix)
+    local ok, raw = pcall(function() return HttpService:GetAsync(url) end)
+    if not ok then return {}, nil end
+    local ok2, parsed = pcall(function() return HttpService:JSONDecode(raw) end)
+    if not ok2 or type(parsed) ~= "table" then return {}, nil end
+    return parsed.data or {}, parsed.nextPageCursor
+end
 
-local function sendDanger(reason)
-    if tick() - lastNotify < 8 then return end
-    lastNotify = tick()
-    pcall(function()
-        notif.send("danger!", reason or "pls reduce script", 5)
+local function GatherCandidates()
+    local cursor = nil
+    local pool   = {}
+
+    for _ = 1, CONFIG.Hop.FetchPages do
+        local chunk, next = FetchPage(cursor)
+        for _, sv in ipairs(chunk) do
+            if sv.id ~= game.JobId
+                and type(sv.playing)    == "number"
+                and type(sv.maxPlayers) == "number"
+                and sv.playing < sv.maxPlayers
+                and sv.playing >= 0
+            then
+                table.insert(pool, sv)
+            end
+        end
+        cursor = next
+        if not next then break end
+        task.wait(0.1)
+    end
+
+    table.sort(pool, function(a, b)
+        return (a.playing or 9999) < (b.playing or 9999)
+    end)
+    return pool
+end
+
+local function DoHop()
+    if State.Hopping then return end
+    State.Hopping = true
+
+    task.spawn(function()
+        local candidates = GatherCandidates()
+        local limit      = math.min(CONFIG.Hop.CandidatePool, #candidates)
+
+        local success = false
+        if limit > 0 then
+            local pick = candidates[math.random(1, limit)]
+            success = pcall(
+                TeleportService.TeleportToPlaceInstance,
+                TeleportService, Place, pick.id, LP
+            )
+        end
+
+        if not success then
+            pcall(TeleportService.Teleport, TeleportService, Place, LP)
+        end
+
+        task.delay(CONFIG.Hop.RetryDelay, function()
+            State.Hopping = false
+        end)
     end)
 end
 
-local function addViolation(type)
-    local now = tick()
-    table.insert(violations, {t = now, type = type})
-    -- bersihkan yang lama
-    for i = #violations, 1, -1 do
-        if now - violations[i].t > SPAM_WINDOW then
-            table.remove(violations, i)
-        end
-    end
-    if #violations >= SPAM_COUNT then
-        sendDanger("excessive "..type.." detected")
-        violations = {}
-    end
+-- ════════════════════════════════════════════════════════════════
+-- STAFF DETECTION
+-- ════════════════════════════════════════════════════════════════
+local function Lower(s)
+    return tostring(s):lower()
 end
 
-local function isStaff(player)
-    if table.find(STAFF_USERNAMES, player.Name) then return true end
-    if STAFF_GROUP_ID ~= 0 then
-        local s, rank = pcall(function() return player:GetRankInGroup(STAFF_GROUP_ID) end)
-        if s and rank >= STAFF_MIN_RANK then return true end
-    end
-    local lower = player.DisplayName:lower()
-    if lower:find("mod") or lower:find("admin") or lower:find("dev") or lower:find("staff") then
-        return true
+local function MatchUsername(name)
+    local ln = Lower(name)
+    for _, entry in ipairs(CONFIG.Staff.Usernames) do
+        if Lower(entry) == ln then return true end
     end
     return false
 end
 
-local function serverHop()
-    pcall(function() notif.send("staff detected!", "hopping server...", 5) end)
-    task.wait(1)
-    local placeId = game.PlaceId
-    local servers = {}
-    local s, result = pcall(function()
-        return HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/"..placeId.."/servers/Public?sortOrder=Asc&limit=100"))
+local function MatchKeyword(displayName)
+    local ln = Lower(displayName)
+    for _, kw in ipairs(CONFIG.Staff.Keywords) do
+        if ln:find(Lower(kw), 1, true) then
+            return true, kw
+        end
+    end
+    return false, nil
+end
+
+local function CheckGroupRank(player)
+    if CONFIG.Staff.GroupID == 0 then return false end
+    local ok, rank = pcall(function()
+        return player:GetRankInGroup(CONFIG.Staff.GroupID)
     end)
-    if s and result and result.data then
-        for _, server in ipairs(result.data) do
-            if server.playing < server.maxPlayers and server.id ~= game.JobId then
-                table.insert(servers, server.id)
+    return ok and (rank or 0) >= CONFIG.Staff.MinRank
+end
+
+local function EvaluatePlayer(player)
+    if MatchUsername(player.Name) then
+        return true, "username_match"
+    end
+    local hit, kw = MatchKeyword(player.DisplayName)
+    if hit then return true, "keyword:" .. kw end
+    if CheckGroupRank(player) then return true, "group_rank≥" .. CONFIG.Staff.MinRank end
+    return false, nil
+end
+
+local function OnStaffDetected(player, reason)
+    if State.StaffLocked or State.Hopping then return end
+    State.StaffLocked = true
+    Notify(
+        "⚠️ STAFF DETECTED",
+        ("[%s] %s | Hopping to safe server..."):format(reason, player.Name),
+        5
+    )
+    task.delay(1.5, DoHop)
+end
+
+local function ScanPlayers()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP then
+            local flagged, why = EvaluatePlayer(p)
+            if flagged then
+                OnStaffDetected(p, why)
+                return
             end
         end
     end
-    if #servers > 0 then
-        TeleportService:TeleportToPlaceInstance(placeId, servers[math.random(1,#servers)], LocalPlayer)
-    else
-        TeleportService:Teleport(placeId, LocalPlayer)
-    end
 end
 
--- Staff monitor
-Players.PlayerAdded:Connect(function(plr)
-    if isStaff(plr) then serverHop() end
-end)
-for _, plr in ipairs(Players:GetPlayers()) do
-    if plr ~= LocalPlayer and isStaff(plr) then serverHop() break end
-end
+-- ════════════════════════════════════════════════════════════════
+-- VIOLATION ENGINE
+-- ════════════════════════════════════════════════════════════════
+local function RecordViolation()
+    local now = tick()
+    table.insert(State.Violations, now)
 
--- Excessive script monitor
-local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-local HRP = Character:WaitForChild("HumanoidRootPart")
-local Humanoid = Character:WaitForChild("Humanoid")
-
-LocalPlayer.CharacterAdded:Connect(function(char)
-    Character = char
-    HRP = char:WaitForChild("HumanoidRootPart")
-    Humanoid = char:WaitForChild("Humanoid")
-end)
-
-local lastPos = HRP.Position
-RunService.Heartbeat:Connect(function(dt)
-    if not HRP or not Humanoid then return end
-    local pos = HRP.Position
-    local dist = (pos - lastPos).Magnitude
-    local speed = dist / dt
-
-    -- Teleport spam
-    if dist > TP_DISTANCE_THRESHOLD then
-        addViolation("teleport")
-    end
-
-    -- Speed hack
-    if speed > SPEED_THRESHOLD and Humanoid.MoveDirection.Magnitude > 0 then
-        addViolation("speed")
-    end
-
-    -- Fly detection
-    if Humanoid.FloorMaterial == Enum.Material.Air then
-        if not flyStart then flyStart = tick() end
-        if tick() - flyStart > FLY_TIME_THRESHOLD and speed > 50 then
-            addViolation("fly")
-            flyStart = tick()
+    local trimmed = {}
+    for _, t in ipairs(State.Violations) do
+        if now - t <= CONFIG.Troll.ViolationWindow then
+            table.insert(trimmed, t)
         end
-    else
-        flyStart = nil
     end
+    State.Violations = trimmed
 
-    lastPos = pos
-end)
+    if #State.Violations >= CONFIG.Troll.ViolationLimit then
+        if now - State.LastNotifAt >= CONFIG.Troll.NotifCooldown then
+            State.LastNotifAt = now
+            State.Violations  = {}
+            Notify("danger!", "pls reduce script", 5)
+        end
+    end
+end
 
--- Deteksi spam tool / remote
-local remoteSpam = {}
-local function hookRemote(remote)
-    local old
-    old = hookfunction(remote.FireServer, function(self,...)
-        local now = tick()
-        remoteSpam[self] = remoteSpam[self] or {}
-        table.insert(remoteSpam[self], now)
-        -- bersihkan
-        for i = #remoteSpam[self], 1, -1 do
-            if now - remoteSpam[self][i] > 1 then
-                table.remove(remoteSpam[self], i)
+-- ════════════════════════════════════════════════════════════════
+-- UNIFIED __namecall HOOK CHAIN
+-- (Remote Spy + Anti-Kick in single hook to avoid chain conflicts)
+-- ════════════════════════════════════════════════════════════════
+local function InstallNamecallChain()
+    local mt  = getrawmetatable(game)
+    if not mt then return end
+    local raw = rawget(mt, "__namecall")
+    if not raw then return end
+
+    local ro = isreadonly(mt)
+    if ro then setreadonly(mt, false) end
+
+    rawset(mt, "__namecall", newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+
+        -- Anti-Kick: intercept :Kick() on LocalPlayer
+        if method == "Kick"
+            and typeof(self) == "Instance"
+            and self:IsA("Player")
+            and self == LP
+        then
+            Notify("🛡️ KICK BLOCKED", "Kick intercepted — hopping server!", 5)
+            task.delay(0.2, DoHop)
+            return
+        end
+
+        -- Remote Spy: intercept :FireServer() for spam detection
+        if method == "FireServer"
+            and typeof(self) == "Instance"
+            and self:IsA("RemoteEvent")
+        then
+            local now   = tick()
+            local entry = State.RemoteCache[self]
+
+            if not entry or (now - entry.window > 1) then
+                State.RemoteCache[self] = { count = 1, window = now }
+            else
+                entry.count = entry.count + 1
+                if entry.count > CONFIG.Troll.RemoteSpamLimit then
+                    RecordViolation()
+                end
             end
         end
-        if #remoteSpam[self] > 20 then
-            addViolation("remote spam")
-            remoteSpam[self] = {}
-        end
-        return old(self,...)
-    end)
+
+        return raw(self, ...)
+    end))
+
+    if ro then setreadonly(mt, true) end
+    State.NamecallChain = true
 end
 
-for _, v in ipairs(game:GetDescendants()) do
-    if v:IsA("RemoteEvent") then
-        pcall(function() hookRemote(v) end)
+-- ════════════════════════════════════════════════════════════════
+-- COREGUI KICK PROMPT MONITOR
+-- ════════════════════════════════════════════════════════════════
+local function MonitorCoreGuiKick()
+    local KickPatterns = {
+        "you were kicked",
+        "disconnected from",
+        "kicked by",
+        "you have been kicked",
+        "connection lost",
+    }
+
+    local function EvaluateDescendant(inst)
+        if not (inst:IsA("TextLabel") or inst:IsA("TextButton")) then return end
+        local text = Lower(inst.Text or "")
+        for _, pat in ipairs(KickPatterns) do
+            if text:find(pat, 1, true) then
+                if not State.Hopping then
+                    Notify("🛡️ KICK PROMPT", "CoreGui kick screen detected — hopping!", 5)
+                    DoHop()
+                end
+                return
+            end
+        end
     end
+
+    local conn = CoreGui.DescendantAdded:Connect(function(inst)
+        task.defer(EvaluateDescendant, inst)
+    end)
+    table.insert(State.Connections, conn)
 end
+
+-- ════════════════════════════════════════════════════════════════
+-- CHARACTER BINDING + AUTO-REBIND
+-- ════════════════════════════════════════════════════════════════
+local function BindCharacter(char)
+    State.Char     = char
+    State.Root     = char:WaitForChild("HumanoidRootPart", 10)
+    State.Hum      = char:WaitForChild("Humanoid", 10)
+    State.LastPos  = State.Root and State.Root.Position or nil
+    State.AirTimer = 0
+end
+
+-- ════════════════════════════════════════════════════════════════
+-- HEARTBEAT LOOP — TROLL DETECTION SCAN
+-- ════════════════════════════════════════════════════════════════
+local function StartHeartbeat()
+    local conn = RunService.Heartbeat:Connect(function(dt)
+        local root = State.Root
+        local hum  = State.Hum
+        local last = State.LastPos
+
+        if not root or not root.Parent or not hum then return end
+
+        local pos = root.Position
+
+        if last then
+            local delta = (pos - last).Magnitude
+
+            if delta > CONFIG.Troll.TeleThreshold then
+                RecordViolation()
+            end
+
+            if dt > 0 and hum.MoveDirection.Magnitude > 0 then
+                local speed = delta / dt
+                if speed > CONFIG.Troll.SpeedThreshold then
+                    RecordViolation()
+                end
+            end
+        end
+
+        if hum.FloorMaterial == Enum.Material.Air then
+            local vel     = root.AssemblyLinearVelocity
+            local hSpeed  = Vector2.new(vel.X, vel.Z).Magnitude
+            if hSpeed >= CONFIG.Troll.FlySpeedMin then
+                State.AirTimer = State.AirTimer + dt
+                if State.AirTimer >= CONFIG.Troll.FlyTimeLimit then
+                    RecordViolation()
+                    State.AirTimer = 0
+                end
+            else
+                State.AirTimer = 0
+            end
+        else
+            State.AirTimer = 0
+        end
+
+        State.LastPos = pos
+    end)
+
+    table.insert(State.Connections, conn)
+end
+
+-- ════════════════════════════════════════════════════════════════
+-- CLEANUP UTILITY
+-- ════════════════════════════════════════════════════════════════
+local function Cleanup()
+    for _, c in ipairs(State.Connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    State.Connections = {}
+end
+
+-- ════════════════════════════════════════════════════════════════
+-- INIT
+-- ════════════════════════════════════════════════════════════════
+local function Init()
+    pcall(InstallNamecallChain)
+    MonitorCoreGuiKick()
+    ScanPlayers()
+
+    local c1 = Players.PlayerAdded:Connect(function(p)
+        if p == LP then return end
+        task.delay(0.5, function()
+            if not p or not p.Parent then return end
+            local flagged, why = EvaluatePlayer(p)
+            if flagged then OnStaffDetected(p, why) end
+        end)
+    end)
+    table.insert(State.Connections, c1)
+
+    if LP.Character then
+        BindCharacter(LP.Character)
+    end
+
+    local c2 = LP.CharacterAdded:Connect(function(char)
+        State.StaffLocked = false
+        State.AirTimer    = 0
+        BindCharacter(char)
+    end)
+    table.insert(State.Connections, c2)
+
+    StartHeartbeat()
+end
+
+Init()
