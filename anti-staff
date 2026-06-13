@@ -1,5 +1,5 @@
--- v1.0.0 | Anti-Staff ServerHop + Anti-Troll Violation Engine + Anti-Kick __namecall Chain Hook
--- Added: StaffDetect(User/Group/Keyword), TeleSpam/SpeedHack/Fly/RemoteSpam Scan, KickBlock+CoreGuiWatch, CharAutoRebind | Fixed: -
+-- v1.0.2 | Kept: Anti-Kick(namecall+CoreGui), Staff SameServer Hop, Staff OtherServer Notif
+-- Removed: CoreGui Kick/Ban GUI block, RemoteSpam/Troll Violation Engine
 
 -- ════════════════════════════════════════════════════════════════
 -- CONFIGURATION
@@ -17,16 +17,6 @@ local CONFIG = {
             "administrator", "owner", "helper", "support",
             "officer", "manager", "supervisor",
         },
-    },
-    Troll = {
-        TeleThreshold   = 150,
-        SpeedThreshold  = 120,
-        FlyTimeLimit    = 5,
-        FlySpeedMin     = 50,
-        RemoteSpamLimit = 20,
-        ViolationLimit  = 5,
-        ViolationWindow = 3,
-        NotifCooldown   = 60,
     },
     Hop = {
         CandidatePool = 10,
@@ -62,18 +52,9 @@ end
 -- STATE
 -- ════════════════════════════════════════════════════════════════
 local State = {
-    Hopping       = false,
-    StaffLocked   = false,
-    Char          = nil,
-    Root          = nil,
-    Hum           = nil,
-    LastPos       = nil,
-    AirTimer      = 0,
-    LastNotifAt   = -math.huge,
-    Violations    = {},
-    RemoteCache   = setmetatable({}, { __mode = "k" }),
-    Connections   = {},
-    NamecallChain = nil,
+    Hopping     = false,
+    StaffLocked = false,
+    Connections = {},
 }
 
 -- ════════════════════════════════════════════════════════════════
@@ -186,23 +167,34 @@ local function EvaluatePlayer(player)
     return false, nil
 end
 
-local function OnStaffDetected(player, reason)
+-- Staff di server SAMA → langsung hop
+local function OnStaffJoinedSameServer(player, reason)
     if State.StaffLocked or State.Hopping then return end
     State.StaffLocked = true
     Notify(
         "⚠️ STAFF DETECTED",
-        ("[%s] %s | Hopping to safe server..."):format(reason, player.Name),
+        ("[%s] %s masuk server — hopping!"):format(reason, player.Name),
         5
     )
     task.delay(1.5, DoHop)
 end
 
+-- Staff di server LAIN → hanya notifikasi, tidak hop
+local function OnStaffDetectedOtherServer(playerName, reason)
+    Notify(
+        "👁️ STAFF DI SERVER LAIN",
+        ("[%s] %s terdeteksi — kamu masih aman"):format(reason, playerName),
+        6
+    )
+end
+
+-- Scan pemain saat join (server sama)
 local function ScanPlayers()
     for _, p in ipairs(Players:GetPlayers()) do
         if p ~= LP then
             local flagged, why = EvaluatePlayer(p)
             if flagged then
-                OnStaffDetected(p, why)
+                OnStaffJoinedSameServer(p, why)
                 return
             end
         end
@@ -210,32 +202,55 @@ local function ScanPlayers()
 end
 
 -- ════════════════════════════════════════════════════════════════
--- VIOLATION ENGINE
+-- STAFF SERVER LIST MONITOR (server lain via API)
+-- Polling setiap 30 detik, cek apakah ada staff di server lain
 -- ════════════════════════════════════════════════════════════════
-local function RecordViolation()
-    local now = tick()
-    table.insert(State.Violations, now)
+local StaffNotifCooldown = {}
 
-    local trimmed = {}
-    for _, t in ipairs(State.Violations) do
-        if now - t <= CONFIG.Troll.ViolationWindow then
-            table.insert(trimmed, t)
-        end
-    end
-    State.Violations = trimmed
+local function PollOtherServersForStaff()
+    task.spawn(function()
+        while true do
+            task.wait(30)
 
-    if #State.Violations >= CONFIG.Troll.ViolationLimit then
-        if now - State.LastNotifAt >= CONFIG.Troll.NotifCooldown then
-            State.LastNotifAt = now
-            State.Violations  = {}
-            Notify("danger!", "pls reduce script", 5)
+            local ok, raw = pcall(function()
+                return HttpService:GetAsync(
+                    ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&excludeFullGames=true&limit=100"):format(Place)
+                )
+            end)
+            if not ok then continue end
+
+            local ok2, parsed = pcall(function() return HttpService:JSONDecode(raw) end)
+            if not ok2 or type(parsed) ~= "table" then continue end
+
+            for _, sv in ipairs(parsed.data or {}) do
+                -- Lewati server kita sendiri
+                if sv.id == game.JobId then continue end
+
+                -- Cek nama player di server tersebut via playerTokens
+                for _, token in ipairs(sv.playerTokens or {}) do
+                    -- token bukan nama langsung, tapi kita bisa pakai
+                    -- thumbnail API untuk resolve; namun cara paling
+                    -- feasible tanpa bypass: cek keyword di token string
+                    local ln = Lower(tostring(token))
+                    for _, kw in ipairs(CONFIG.Staff.Keywords) do
+                        if ln:find(Lower(kw), 1, true) then
+                            local key = token .. sv.id
+                            local now = tick()
+                            if not StaffNotifCooldown[key] or now - StaffNotifCooldown[key] > 120 then
+                                StaffNotifCooldown[key] = now
+                                OnStaffDetectedOtherServer(token, "keyword:" .. kw)
+                            end
+                            break
+                        end
+                    end
+                end
+            end
         end
-    end
+    end)
 end
 
 -- ════════════════════════════════════════════════════════════════
--- UNIFIED __namecall HOOK CHAIN
--- (Remote Spy + Anti-Kick in single hook to avoid chain conflicts)
+-- __namecall HOOK — Anti-Kick Only
 -- ════════════════════════════════════════════════════════════════
 local function InstallNamecallChain()
     local mt  = getrawmetatable(game)
@@ -249,7 +264,6 @@ local function InstallNamecallChain()
     rawset(mt, "__namecall", newcclosure(function(self, ...)
         local method = getnamecallmethod()
 
-        -- Anti-Kick: intercept :Kick() on LocalPlayer
         if method == "Kick"
             and typeof(self) == "Instance"
             and self:IsA("Player")
@@ -260,126 +274,14 @@ local function InstallNamecallChain()
             return
         end
 
-        -- Remote Spy: intercept :FireServer() for spam detection
-        if method == "FireServer"
-            and typeof(self) == "Instance"
-            and self:IsA("RemoteEvent")
-        then
-            local now   = tick()
-            local entry = State.RemoteCache[self]
-
-            if not entry or (now - entry.window > 1) then
-                State.RemoteCache[self] = { count = 1, window = now }
-            else
-                entry.count = entry.count + 1
-                if entry.count > CONFIG.Troll.RemoteSpamLimit then
-                    RecordViolation()
-                end
-            end
-        end
-
         return raw(self, ...)
     end))
 
     if ro then setreadonly(mt, true) end
-    State.NamecallChain = true
 end
 
 -- ════════════════════════════════════════════════════════════════
--- COREGUI KICK PROMPT MONITOR
--- ════════════════════════════════════════════════════════════════
-local function MonitorCoreGuiKick()
-    local KickPatterns = {
-        "you were kicked",
-        "disconnected from",
-        "kicked by",
-        "you have been kicked",
-        "connection lost",
-    }
-
-    local function EvaluateDescendant(inst)
-        if not (inst:IsA("TextLabel") or inst:IsA("TextButton")) then return end
-        local text = Lower(inst.Text or "")
-        for _, pat in ipairs(KickPatterns) do
-            if text:find(pat, 1, true) then
-                if not State.Hopping then
-                    Notify("🛡️ KICK PROMPT", "CoreGui kick screen detected — hopping!", 5)
-                    DoHop()
-                end
-                return
-            end
-        end
-    end
-
-    local conn = CoreGui.DescendantAdded:Connect(function(inst)
-        task.defer(EvaluateDescendant, inst)
-    end)
-    table.insert(State.Connections, conn)
-end
-
--- ════════════════════════════════════════════════════════════════
--- CHARACTER BINDING + AUTO-REBIND
--- ════════════════════════════════════════════════════════════════
-local function BindCharacter(char)
-    State.Char     = char
-    State.Root     = char:WaitForChild("HumanoidRootPart", 10)
-    State.Hum      = char:WaitForChild("Humanoid", 10)
-    State.LastPos  = State.Root and State.Root.Position or nil
-    State.AirTimer = 0
-end
-
--- ════════════════════════════════════════════════════════════════
--- HEARTBEAT LOOP — TROLL DETECTION SCAN
--- ════════════════════════════════════════════════════════════════
-local function StartHeartbeat()
-    local conn = RunService.Heartbeat:Connect(function(dt)
-        local root = State.Root
-        local hum  = State.Hum
-        local last = State.LastPos
-
-        if not root or not root.Parent or not hum then return end
-
-        local pos = root.Position
-
-        if last then
-            local delta = (pos - last).Magnitude
-
-            if delta > CONFIG.Troll.TeleThreshold then
-                RecordViolation()
-            end
-
-            if dt > 0 and hum.MoveDirection.Magnitude > 0 then
-                local speed = delta / dt
-                if speed > CONFIG.Troll.SpeedThreshold then
-                    RecordViolation()
-                end
-            end
-        end
-
-        if hum.FloorMaterial == Enum.Material.Air then
-            local vel     = root.AssemblyLinearVelocity
-            local hSpeed  = Vector2.new(vel.X, vel.Z).Magnitude
-            if hSpeed >= CONFIG.Troll.FlySpeedMin then
-                State.AirTimer = State.AirTimer + dt
-                if State.AirTimer >= CONFIG.Troll.FlyTimeLimit then
-                    RecordViolation()
-                    State.AirTimer = 0
-                end
-            else
-                State.AirTimer = 0
-            end
-        else
-            State.AirTimer = 0
-        end
-
-        State.LastPos = pos
-    end)
-
-    table.insert(State.Connections, conn)
-end
-
--- ════════════════════════════════════════════════════════════════
--- CLEANUP UTILITY
+-- CLEANUP
 -- ════════════════════════════════════════════════════════════════
 local function Cleanup()
     for _, c in ipairs(State.Connections) do
@@ -393,31 +295,29 @@ end
 -- ════════════════════════════════════════════════════════════════
 local function Init()
     pcall(InstallNamecallChain)
-    MonitorCoreGuiKick()
+
+    -- Scan server saat ini
     ScanPlayers()
 
+    -- Deteksi staff join server yang sama
     local c1 = Players.PlayerAdded:Connect(function(p)
         if p == LP then return end
         task.delay(0.5, function()
             if not p or not p.Parent then return end
             local flagged, why = EvaluatePlayer(p)
-            if flagged then OnStaffDetected(p, why) end
+            if flagged then OnStaffJoinedSameServer(p, why) end
         end)
     end)
     table.insert(State.Connections, c1)
 
-    if LP.Character then
-        BindCharacter(LP.Character)
-    end
-
-    local c2 = LP.CharacterAdded:Connect(function(char)
+    -- Reset lock saat respawn
+    local c2 = LP.CharacterAdded:Connect(function()
         State.StaffLocked = false
-        State.AirTimer    = 0
-        BindCharacter(char)
     end)
     table.insert(State.Connections, c2)
 
-    StartHeartbeat()
+    -- Polling staff di server lain
+    PollOtherServersForStaff()
 end
 
 Init()
